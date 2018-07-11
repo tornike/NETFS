@@ -23,13 +23,17 @@ struct netfs_attrs {
     uint32_t ctime;
 } __attribute__((packed));
 
+struct netfs_read_write {
+    uint32_t path_len;
+    uint64_t file_offset;
+    uint64_t count;
+} __attribute__((packed));
+
 /* Operation Types */
 #define GETATTR 1
 #define GETATTR_R 2 // Response
 #define READDIR 3
 #define READDIR_R 4
-#define OPEN 5
-#define OPEN_R 6
 #define READ 7
 #define READ_R 8
 #define ERROR 9

@@ -27,10 +27,8 @@ struct netfs_config {
 
 /* Fuse override function prototypes. */
 static int netfs_getattr(const char *path, struct stat *stbuf);
-static int netfs_opendir(const char *path, struct fuse_file_info *fi);
 static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                          off_t offset, struct fuse_file_info *fi);
-static int netfs_open(const char *path, struct fuse_file_info *fi);
 static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
                       struct fuse_file_info *fi);
 
@@ -63,10 +61,8 @@ int main(int argc, char *argv[])
     init("127.0.0.1", 34344);
     struct fuse_operations netfs_oper = {
         .getattr = netfs_getattr,
-        //.opendir = netfs_opendir,
         .readdir = netfs_readdir,
-        //.open = netfs_open,
-        //.read = netfs_read,
+        .read = netfs_read,
     };
     fuse_main(argc, argv, &netfs_oper, NULL);
 
@@ -129,21 +125,6 @@ static int netfs_getattr(const char *path, struct stat *stbuf)
     }
 }
 
-static int netfs_opendir(const char *path, struct fuse_file_info *fi)
-{
-    dprintf(err, "opendir %s %ld\n", path, pthread_self()); // !!!
-
-    char *full_path = malloc(strlen(path) + strlen(root_directory) + 1); // !!!
-    strcpy(full_path, root_directory); // !!!
-    strcat(full_path, path); // !!!
-
-    DIR *dirp = opendir(full_path);
-    if (dirp == NULL)
-        return -errno;
-    fi->fh = (uint64_t)dirp;
-    return 0;
-}
-
 static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                          off_t offset, struct fuse_file_info *fi)
 {
@@ -169,7 +150,7 @@ static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     //
     if (recv_packet_header.operation != READDIR_R &&
         recv_packet_header.operation != ERROR) {
-        printf("Wrong Packet READDIR\n");
+        printf("Wrong Packet READDIR %d\n", recv_packet_header.operation);
     }
     //
 
@@ -203,69 +184,62 @@ static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     return -ENOENT;
 }
 
-static int netfs_open(const char *path, struct fuse_file_info *fi)
+static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
+                      struct fuse_file_info *fi)
 {
     int path_len = strlen(path);
-    uint32_t send_payload_length = sizeof(int) + path_len;
+    uint32_t send_payload_length = sizeof(struct netfs_read_write) + path_len;
     uint8_t send_packet[NETFS_PACKET_SIZE(send_payload_length)];
-    PREP_NETFS_HEADER(send_packet, send_payload_length, OPEN);
-    void *send_payload = NETFS_PAYLOAD(send_packet);
-    *(int *)send_payload = htonl(fi->flags);
-    strncpy(OFFSET(send_payload, sizeof(int)), path, path_len);
+    PREP_NETFS_HEADER(send_packet, send_payload_length, READ);
+
+    struct netfs_read_write *send_payload =
+        (struct netfs_read_write *)NETFS_PAYLOAD(send_packet);
+    send_payload->path_len = htonl(path_len);
+    send_payload->count = htobe64(size);
+    send_payload->file_offset = htobe64(offset);
+    strncpy(OFFSET(send_payload, sizeof(struct netfs_read_write)), path,
+            path_len);
 
     struct netfs_header recv_packet_header;
     if (sendall(cfg.sock_fd, send_packet,
                 NETFS_PACKET_SIZE(send_payload_length)) == -1) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
         return -ENOENT;
-    } else if (recvall(cfg.sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) ==
-               -1) {
+    }
+    if (recvall(cfg.sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) == -1) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
         return -ENOENT;
-    } else {
-        assert(recv_packet_header.operation == OPEN ||
-               recv_packet_header.operation == ERROR);
-        recv_packet_header.payload_length =
-            ntohl(recv_packet_header.payload_length);
-        // if (recvall(cfg.sock_fd, hash0,
-        // recv_packet_header.payload_length) ==
-        //     -1) {
-        //     RECONNECT(0);
-        // } else {
-        //     if (recv_packet_header.operation == ERROR) {
-        //         errno = ntohl(*(uint32_t *)hash0);
-        //         printf("OPEN0 ERROR%d\n", errno);
-        //         pthread_mutex_unlock(&config->lock);
-        //         return -errno;
-        //     } else {
-        //         printf("OPEN0: %s\n", path); // !!!
-        //     }
-        // }
     }
 
-    char *full_path = malloc(strlen(path) + strlen(root_directory) + 1); // !!!
-    strcpy(full_path, root_directory); // !!!
-    strcat(full_path, path); // !!!
+    //
+    if (recv_packet_header.operation != READ_R &&
+        recv_packet_header.operation != ERROR) {
+        printf("Wrong Packet READ\n");
+    }
+    //
 
-    int fd = open(full_path, fi->flags);
-    if (fd == -1)
+    recv_packet_header.payload_length =
+        ntohl(recv_packet_header.payload_length);
+    void *recv_packet_payload = malloc(recv_packet_header.payload_length);
+    if (recvall(cfg.sock_fd, recv_packet_payload,
+                recv_packet_header.payload_length) == -1) {
+        fprintf(stderr, "No connection %s\n", strerror(errno));
+        free(recv_packet_payload);
+        return -ENOENT;
+    }
+
+    if (recv_packet_header.operation == ERROR) {
+        errno = ntohl(*(uint32_t *)recv_packet_payload);
+        printf("READ ERROR%d\n", errno);
+        free(recv_packet_payload);
         return -errno;
-    fi->fh = fd;
+    } else {
+        printf("READ: %s %lu %lu\n", path, size, offset); // !!!
+        int read_bytes = recv_packet_header.payload_length;
+        memcpy(buf, recv_packet_payload, recv_packet_header.payload_length);
+        free(recv_packet_payload);
+        return read_bytes;
+    }
 
-    dprintf(err, "open %s %u %ld\n", path, fi, pthread_self()); // !!!
-    return 0;
-}
-
-static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
-                      struct fuse_file_info *fi)
-{
-    if (lseek(fi->fh, offset, SEEK_SET) == -1)
-        return -errno;
-    int rd = read(fi->fh, buf, size);
-    if (rd == -1)
-        return -errno;
-
-    dprintf(err, "read %s %lu %lu %ld\n", path, size, offset,
-            pthread_self()); // !!!
-    return rd;
+    return -ENOENT;
 }

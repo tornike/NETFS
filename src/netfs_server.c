@@ -1,7 +1,9 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <endian.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -10,6 +12,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "protocol.h"
 
@@ -97,7 +101,6 @@ void *client_handler(void *arg)
 
     struct netfs_header recv_packet_header;
     while (true) {
-        printf(";)\n");
         if (recvall(client_socket_fd, &recv_packet_header, NETFS_HEADER_SIZE) ==
             -1)
             return NULL; // Connection loss.
@@ -192,12 +195,70 @@ void *client_handler(void *arg)
                             entry->d_name, str_length);
                     send_payload_length += str_length;
                 }
-                PREP_NETFS_HEADER(send_packet, send_payload_length, READDIR);
+                PREP_NETFS_HEADER(send_packet, send_payload_length, READDIR_R);
                 sendall(client_socket_fd, send_packet,
                         NETFS_PACKET_SIZE(send_payload_length));
                 free(send_packet);
                 closedir(dirp);
             }
+        } break;
+        case READ: {
+            uint8_t recv_packet_payload[recv_packet_header.payload_length];
+            recvall(client_socket_fd, recv_packet_payload,
+                    recv_packet_header.payload_length);
+
+            struct netfs_read_write *inf =
+                (struct netfs_read_write *)recv_packet_payload;
+            inf->path_len = ntohl(inf->path_len);
+            inf->count = be64toh(inf->count);
+            inf->file_offset = be64toh(inf->file_offset);
+
+            char path[inf->path_len + 1];
+            path[inf->path_len] = '\0';
+            strncpy(
+                path,
+                OFFSET(recv_packet_payload, sizeof(struct netfs_read_write)),
+                inf->path_len);
+            fprintf(stdout, "READ %s %lu %lu\n", path, inf->count,
+                    inf->file_offset); // !!!
+
+            FULL_PATH(path);
+
+            int fd = open(full_path, O_RDWR);
+            if (fd == -1 || lseek(fd, inf->file_offset, SEEK_SET) == -1) {
+                /* Send errno */
+                uint32_t tmp_errno = errno;
+                send_payload_length = sizeof(uint32_t);
+                uint8_t send_packet[NETFS_PACKET_SIZE(send_payload_length)];
+                PREP_NETFS_HEADER(send_packet, send_payload_length, ERROR);
+                *(uint32_t *)NETFS_PAYLOAD(send_packet) = htonl(tmp_errno);
+                fprintf(stdout, "READ: sending errno %d\n", tmp_errno); //!!!
+                sendall(client_socket_fd, send_packet,
+                        NETFS_PACKET_SIZE(
+                            send_payload_length)); // check return result
+            } else {
+                void *send_packet = malloc(NETFS_PACKET_SIZE(inf->count));
+
+                int read_bytes =
+                    read(fd, NETFS_PAYLOAD(send_packet), inf->count);
+                if (read_bytes == -1) {
+                    /* Send errno */
+                    uint32_t tmp_errno = errno;
+                    send_payload_length = sizeof(uint32_t);
+                    PREP_NETFS_HEADER(send_packet, send_payload_length, ERROR);
+                    *(uint32_t *)NETFS_PAYLOAD(send_packet) = htonl(tmp_errno);
+                    fprintf(stdout, "READ: Sending errno %d\n",
+                            tmp_errno); //!!!
+                } else {
+                    send_payload_length = read_bytes;
+                    PREP_NETFS_HEADER(send_packet, send_payload_length, READ_R);
+                }
+                sendall(client_socket_fd, send_packet,
+                        NETFS_PACKET_SIZE(
+                            send_payload_length)); // check return result
+                free(send_packet);
+            }
+            close(fd);
         } break;
         default:
             fprintf(stdout, "UNKNOWN OP %u\n", recv_packet_header.operation);
