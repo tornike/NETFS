@@ -16,8 +16,9 @@
 
 #include "protocol.h"
 
+#define CLIENT_ARGUMENT_COUNT 4
+
 char *root_directory = "datadir/";
-int err = 2; // stdout
 
 struct netfs_config {
     char server_name[20];
@@ -58,13 +59,20 @@ void init(char *ip, uint16_t port)
 /* -f Foreground, -s Single Threaded */
 int main(int argc, char *argv[])
 {
-    init("127.0.0.1", 34344);
+    if (argc < CLIENT_ARGUMENT_COUNT) {
+        fprintf(stdout,
+                "%s: Usage: %s [optional: arguments for fuse] [mount point] "
+                "[storage address] [storage port]\n",
+                argv[0], argv[0]);
+        return EXIT_FAILURE;
+    }
+    init(argv[argc - 2], atoi(argv[argc - 1]));
     struct fuse_operations netfs_oper = {
         .getattr = netfs_getattr,
         .readdir = netfs_readdir,
         .read = netfs_read,
     };
-    fuse_main(argc, argv, &netfs_oper, NULL);
+    fuse_main(argc - 2, argv, &netfs_oper, NULL);
 
     return 0;
 }
