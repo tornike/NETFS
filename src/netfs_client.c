@@ -18,10 +18,7 @@
 
 #define CLIENT_ARGUMENT_COUNT 4
 
-char *root_directory = "datadir/";
-
 struct netfs_config {
-    char server_name[20];
     struct sockaddr_in server_addr;
     int sock_fd;
 };
@@ -42,7 +39,7 @@ void init(char *ip, uint16_t port)
     cfg.server_addr.sin_port = htons(port);
     inet_pton(AF_INET, ip, &cfg.server_addr.sin_addr.s_addr);
 
-    if ((cfg.sock_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+    if ((cfg.sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         dprintf(STDOUT_FILENO, "Socket creation failed! Error: %s\n",
                 strerror(errno));
         exit(EXIT_FAILURE);
@@ -50,7 +47,7 @@ void init(char *ip, uint16_t port)
 
     // Multiple ?
     if (connect(cfg.sock_fd, (struct sockaddr *)&cfg.server_addr,
-                sizeof(struct sockaddr_in)) != 0) {
+                sizeof(struct sockaddr_in)) < 0) {
         printf("Could not connect %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
@@ -91,27 +88,26 @@ static int netfs_getattr(const char *path, struct stat *stbuf)
 
     struct netfs_header recv_packet_header;
     if (sendall(cfg.sock_fd, send_packet,
-                NETFS_PACKET_SIZE(send_payload_length)) == -1) {
+                NETFS_PACKET_SIZE(send_payload_length)) < 0) {
         printf("Connection Lost Send %s\n", strerror(errno));
         return -ENOENT;
     }
-    if (recvall(cfg.sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) == -1) {
+    if (recvall(cfg.sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
         printf("Connection Lost Recv %s\n", strerror(errno));
         return -ENOENT;
     }
 
-    //
     if (recv_packet_header.operation != GETATTR_R &&
         recv_packet_header.operation != ERROR) {
-        printf("Wrong Packet GETATTR %d\n", recv_packet_header.operation);
+        fprintf(stderr, "Unknown packet in GETATTR %d\n",
+                recv_packet_header.operation);
     }
-    //
 
     recv_packet_header.payload_length =
         ntohl(recv_packet_header.payload_length);
     uint8_t recv_packet_payload[recv_packet_header.payload_length];
     if (recvall(cfg.sock_fd, &recv_packet_payload,
-                recv_packet_header.payload_length) == -1) {
+                recv_packet_header.payload_length) < 0) {
         printf("Connection Lost Recv 2 %s\n", strerror(errno));
         return -ENOENT;
     }
@@ -146,27 +142,26 @@ static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
     struct netfs_header recv_packet_header;
     if (sendall(cfg.sock_fd, send_packet,
-                NETFS_PACKET_SIZE(send_payload_length)) == -1) {
+                NETFS_PACKET_SIZE(send_payload_length)) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
         return -ENOENT;
     }
-    if (recvall(cfg.sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) == -1) {
+    if (recvall(cfg.sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
         return -ENOENT;
     }
 
-    //
     if (recv_packet_header.operation != READDIR_R &&
         recv_packet_header.operation != ERROR) {
-        printf("Wrong Packet READDIR %d\n", recv_packet_header.operation);
+        fprintf(stderr, "Unknown packet in READDIR %d\n",
+                recv_packet_header.operation);
     }
-    //
 
     recv_packet_header.payload_length =
         ntohl(recv_packet_header.payload_length);
     uint8_t recv_packet_payload[recv_packet_header.payload_length];
     if (recvall(cfg.sock_fd, recv_packet_payload,
-                recv_packet_header.payload_length) == -1) {
+                recv_packet_header.payload_length) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
         return -ENOENT;
     }
@@ -195,6 +190,8 @@ static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
                       struct fuse_file_info *fi)
 {
+    fprintf(stdout, "Read %s %ld\n", path, pthread_self()); // !!!
+
     int path_len = strlen(path);
     uint32_t send_payload_length = sizeof(struct netfs_read_write) + path_len;
     uint8_t send_packet[NETFS_PACKET_SIZE(send_payload_length)];
@@ -210,27 +207,26 @@ static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
 
     struct netfs_header recv_packet_header;
     if (sendall(cfg.sock_fd, send_packet,
-                NETFS_PACKET_SIZE(send_payload_length)) == -1) {
+                NETFS_PACKET_SIZE(send_payload_length)) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
         return -ENOENT;
     }
-    if (recvall(cfg.sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) == -1) {
+    if (recvall(cfg.sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
         return -ENOENT;
     }
 
-    //
     if (recv_packet_header.operation != READ_R &&
         recv_packet_header.operation != ERROR) {
-        printf("Wrong Packet READ\n");
+        fprintf(stderr, "Unknown packet in READ %d\n",
+                recv_packet_header.operation);
     }
-    //
 
     recv_packet_header.payload_length =
         ntohl(recv_packet_header.payload_length);
     void *recv_packet_payload = malloc(recv_packet_header.payload_length);
     if (recvall(cfg.sock_fd, recv_packet_payload,
-                recv_packet_header.payload_length) == -1) {
+                recv_packet_header.payload_length) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
         free(recv_packet_payload);
         return -ENOENT;
