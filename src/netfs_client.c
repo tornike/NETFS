@@ -1,4 +1,3 @@
-
 #define FUSE_USE_VERSION 26
 
 #include <arpa/inet.h>
@@ -15,13 +14,32 @@
 #include <unistd.h>
 
 #include "protocol.h"
+#include "utlist.h"
 
 #define CLIENT_ARGUMENT_COUNT 4
+#define MAX_CONNECTIONS 4
+
+struct netfs_connection {
+    int sock_fd;
+
+    struct netfs_connection *next;
+    struct netfs_connection *prev;
+};
 
 struct netfs_config {
     struct sockaddr_in server_addr;
-    int sock_fd;
+
+    struct netfs_connection *connections;
+    int connection_count;
+    pthread_mutex_t connections_lock;
+    pthread_cond_t connections_cond;
 };
+
+/* Function prototypes. */
+struct netfs_connection *create_connection();
+void remove_connection(struct netfs_connection *);
+struct netfs_connection *get_connection();
+void add_connection(struct netfs_connection *);
 
 /* Fuse override function prototypes. */
 static int netfs_getattr(const char *path, struct stat *stbuf);
@@ -39,18 +57,9 @@ void init(char *ip, uint16_t port)
     cfg.server_addr.sin_port = htons(port);
     inet_pton(AF_INET, ip, &cfg.server_addr.sin_addr.s_addr);
 
-    if ((cfg.sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        dprintf(STDOUT_FILENO, "Socket creation failed! Error: %s\n",
-                strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-
-    // Multiple ?
-    if (connect(cfg.sock_fd, (struct sockaddr *)&cfg.server_addr,
-                sizeof(struct sockaddr_in)) < 0) {
-        printf("Could not connect %s\n", strerror(errno));
-        exit(EXIT_FAILURE);
-    }
+    cfg.connections = NULL;
+    pthread_mutex_init(&cfg.connections_lock, NULL);
+    pthread_cond_init(&cfg.connections_cond, NULL);
 }
 
 /* -f Foreground, -s Single Threaded */
@@ -74,6 +83,63 @@ int main(int argc, char *argv[])
     return 0;
 }
 
+struct netfs_connection *create_connection()
+{
+    struct netfs_connection *new_con = malloc(sizeof(struct netfs_connection));
+
+    if ((new_con->sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        fprintf(stderr, "Socket creation failed! Error: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    if (connect(new_con->sock_fd, (struct sockaddr *)&cfg.server_addr,
+                sizeof(struct sockaddr_in)) < 0) {
+        fprintf(stderr, "Could not connect %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    fprintf(stdout, "New Connection Created\n");
+    cfg.connection_count++;
+    return new_con;
+}
+
+void remove_connection(struct netfs_connection *con)
+{
+    pthread_mutex_lock(&cfg.connections_lock);
+    close(con->sock_fd);
+    free(con);
+    cfg.connection_count--;
+    pthread_mutex_unlock(&cfg.connections_lock);
+}
+
+struct netfs_connection *get_connection()
+{
+    struct netfs_connection *con = NULL;
+    pthread_mutex_lock(&cfg.connections_lock);
+    if (cfg.connections == NULL) {
+        if (cfg.connection_count < MAX_CONNECTIONS) {
+            con = create_connection();
+        } else {
+            pthread_cond_wait(&cfg.connections_cond, &cfg.connections_lock);
+            con = cfg.connections;
+            DL_DELETE(cfg.connections, con);
+        }
+    } else {
+        con = cfg.connections;
+        DL_DELETE(cfg.connections, con);
+    }
+    pthread_mutex_unlock(&cfg.connections_lock);
+    return con;
+}
+
+void add_connection(struct netfs_connection *con)
+{
+    pthread_mutex_lock(&cfg.connections_lock);
+    DL_APPEND(cfg.connections, con);
+    pthread_cond_signal(&cfg.connections_cond);
+    pthread_mutex_unlock(&cfg.connections_lock);
+}
+
 static int netfs_getattr(const char *path, struct stat *stbuf)
 {
     fprintf(stderr, "Getattr %s %ld\n", path, pthread_self()); // !!!
@@ -86,14 +152,17 @@ static int netfs_getattr(const char *path, struct stat *stbuf)
 
     strncpy(NETFS_PAYLOAD(send_packet), path, send_payload_length);
 
+    struct netfs_connection *con = get_connection();
     struct netfs_header recv_packet_header;
-    if (sendall(cfg.sock_fd, send_packet,
+    if (sendall(con->sock_fd, send_packet,
                 NETFS_PACKET_SIZE(send_payload_length)) < 0) {
         printf("Connection Lost Send %s\n", strerror(errno));
+        remove_connection(con);
         return -ENOENT;
     }
-    if (recvall(cfg.sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
+    if (recvall(con->sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
         printf("Connection Lost Recv %s\n", strerror(errno));
+        remove_connection(con);
         return -ENOENT;
     }
 
@@ -106,14 +175,16 @@ static int netfs_getattr(const char *path, struct stat *stbuf)
     recv_packet_header.payload_length =
         ntohl(recv_packet_header.payload_length);
     uint8_t recv_packet_payload[recv_packet_header.payload_length];
-    if (recvall(cfg.sock_fd, &recv_packet_payload,
+    if (recvall(con->sock_fd, &recv_packet_payload,
                 recv_packet_header.payload_length) < 0) {
         printf("Connection Lost Recv 2 %s\n", strerror(errno));
+        remove_connection(con);
         return -ENOENT;
     }
     if (recv_packet_header.operation == ERROR) {
         errno = ntohl(*(uint32_t *)recv_packet_payload);
         printf("GETATTR %s ERROR %d\n", path, errno); // !!!
+        add_connection(con);
         return -errno;
     } else {
         struct netfs_attrs *attrs = (struct netfs_attrs *)recv_packet_payload;
@@ -125,6 +196,7 @@ static int netfs_getattr(const char *path, struct stat *stbuf)
         stbuf->st_atime = ntohl(attrs->atime);
         stbuf->st_mtime = ntohl(attrs->mtime);
         stbuf->st_ctime = ntohl(attrs->ctime);
+        add_connection(con);
         return 0;
     }
 }
@@ -140,14 +212,17 @@ static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     PREP_NETFS_HEADER(send_packet, send_payload_length, READDIR);
     strncpy(NETFS_PAYLOAD(send_packet), path, send_payload_length);
 
+    struct netfs_connection *con = get_connection();
     struct netfs_header recv_packet_header;
-    if (sendall(cfg.sock_fd, send_packet,
+    if (sendall(con->sock_fd, send_packet,
                 NETFS_PACKET_SIZE(send_payload_length)) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
+        remove_connection(con);
         return -ENOENT;
     }
-    if (recvall(cfg.sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
+    if (recvall(con->sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
+        remove_connection(con);
         return -ENOENT;
     }
 
@@ -160,14 +235,16 @@ static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     recv_packet_header.payload_length =
         ntohl(recv_packet_header.payload_length);
     uint8_t recv_packet_payload[recv_packet_header.payload_length];
-    if (recvall(cfg.sock_fd, recv_packet_payload,
+    if (recvall(con->sock_fd, recv_packet_payload,
                 recv_packet_header.payload_length) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
+        remove_connection(con);
         return -ENOENT;
     }
     if (recv_packet_header.operation == ERROR) {
         errno = ntohl(*(uint32_t *)recv_packet_payload);
         printf("READDIR0 %s ERROR %d\n", path, errno); // !!!
+        add_connection(con);
         return -errno;
     } else {
         char *d_names = (char *)recv_packet_payload;
@@ -182,8 +259,10 @@ static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         }
         printf("READDIR0 %s %u\n", path,
                recv_packet_header.payload_length); // !!!
+        add_connection(con);
         return 0;
     }
+    add_connection(con);
     return -ENOENT;
 }
 
@@ -205,14 +284,17 @@ static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
     strncpy(OFFSET(send_payload, sizeof(struct netfs_read_write)), path,
             path_len);
 
+    struct netfs_connection *con = get_connection();
     struct netfs_header recv_packet_header;
-    if (sendall(cfg.sock_fd, send_packet,
+    if (sendall(con->sock_fd, send_packet,
                 NETFS_PACKET_SIZE(send_payload_length)) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
+        remove_connection(con);
         return -ENOENT;
     }
-    if (recvall(cfg.sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
+    if (recvall(con->sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
+        remove_connection(con);
         return -ENOENT;
     }
 
@@ -225,10 +307,11 @@ static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
     recv_packet_header.payload_length =
         ntohl(recv_packet_header.payload_length);
     void *recv_packet_payload = malloc(recv_packet_header.payload_length);
-    if (recvall(cfg.sock_fd, recv_packet_payload,
+    if (recvall(con->sock_fd, recv_packet_payload,
                 recv_packet_header.payload_length) < 0) {
         fprintf(stderr, "No connection %s\n", strerror(errno));
         free(recv_packet_payload);
+        remove_connection(con);
         return -ENOENT;
     }
 
@@ -236,14 +319,17 @@ static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
         errno = ntohl(*(uint32_t *)recv_packet_payload);
         printf("READ ERROR%d\n", errno);
         free(recv_packet_payload);
+        add_connection(con);
         return -errno;
     } else {
         printf("READ: %s %lu %lu\n", path, size, offset); // !!!
         int read_bytes = recv_packet_header.payload_length;
         memcpy(buf, recv_packet_payload, recv_packet_header.payload_length);
         free(recv_packet_payload);
+        add_connection(con);
         return read_bytes;
     }
 
+    add_connection(con);
     return -ENOENT;
 }
