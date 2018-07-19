@@ -32,7 +32,4 @@ $(OBJECT_DIR)protocol.o: $(SRC_DIR)protocol.c
 clean:
 	rm $(OBJECT_DIR)*
 
-test:
-	if [ ! -d $(OBJECT_DIR) ]; then mkdir OBJECT_DIR; fi
-
 	

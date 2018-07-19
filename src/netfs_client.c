@@ -98,7 +98,6 @@ struct netfs_connection *create_connection()
         exit(EXIT_FAILURE);
     }
 
-    fprintf(stdout, "New Connection Created\n");
     cfg.connection_count++;
     return new_con;
 }
@@ -142,8 +141,6 @@ void add_connection(struct netfs_connection *con)
 
 static int netfs_getattr(const char *path, struct stat *stbuf)
 {
-    fprintf(stderr, "Getattr %s %ld\n", path, pthread_self()); // !!!
-
     memset(stbuf, 0, sizeof(struct stat));
 
     uint32_t send_payload_length = strlen(path);
@@ -156,12 +153,12 @@ static int netfs_getattr(const char *path, struct stat *stbuf)
     struct netfs_header recv_packet_header;
     if (sendall(con->sock_fd, send_packet,
                 NETFS_PACKET_SIZE(send_payload_length)) < 0) {
-        printf("Connection Lost Send %s\n", strerror(errno));
+        printf("Connection Lost %s\n", strerror(errno));
         remove_connection(con);
         return -ENOENT;
     }
     if (recvall(con->sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
-        printf("Connection Lost Recv %s\n", strerror(errno));
+        printf("Connection Lost %s\n", strerror(errno));
         remove_connection(con);
         return -ENOENT;
     }
@@ -177,13 +174,12 @@ static int netfs_getattr(const char *path, struct stat *stbuf)
     uint8_t recv_packet_payload[recv_packet_header.payload_length];
     if (recvall(con->sock_fd, &recv_packet_payload,
                 recv_packet_header.payload_length) < 0) {
-        printf("Connection Lost Recv 2 %s\n", strerror(errno));
+        printf("Connection Lost %s\n", strerror(errno));
         remove_connection(con);
         return -ENOENT;
     }
     if (recv_packet_header.operation == ERROR) {
         errno = ntohl(*(uint32_t *)recv_packet_payload);
-        printf("GETATTR %s ERROR %d\n", path, errno); // !!!
         add_connection(con);
         return -errno;
     } else {
@@ -204,9 +200,6 @@ static int netfs_getattr(const char *path, struct stat *stbuf)
 static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                          off_t offset, struct fuse_file_info *fi)
 {
-    fprintf(stdout, "readdir %s %ld\n", path, pthread_self()); // !!!
-    (void)offset;
-
     uint32_t send_payload_length = strlen(path);
     uint8_t send_packet[NETFS_PACKET_SIZE(send_payload_length)];
     PREP_NETFS_HEADER(send_packet, send_payload_length, READDIR);
@@ -216,12 +209,12 @@ static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     struct netfs_header recv_packet_header;
     if (sendall(con->sock_fd, send_packet,
                 NETFS_PACKET_SIZE(send_payload_length)) < 0) {
-        fprintf(stderr, "No connection %s\n", strerror(errno));
+        fprintf(stderr, "Connection Lost %s\n", strerror(errno));
         remove_connection(con);
         return -ENOENT;
     }
     if (recvall(con->sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
-        fprintf(stderr, "No connection %s\n", strerror(errno));
+        fprintf(stderr, "Connection Lost %s\n", strerror(errno));
         remove_connection(con);
         return -ENOENT;
     }
@@ -237,13 +230,12 @@ static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     uint8_t recv_packet_payload[recv_packet_header.payload_length];
     if (recvall(con->sock_fd, recv_packet_payload,
                 recv_packet_header.payload_length) < 0) {
-        fprintf(stderr, "No connection %s\n", strerror(errno));
+        fprintf(stderr, "Connection Lost %s\n", strerror(errno));
         remove_connection(con);
         return -ENOENT;
     }
     if (recv_packet_header.operation == ERROR) {
         errno = ntohl(*(uint32_t *)recv_packet_payload);
-        printf("READDIR0 %s ERROR %d\n", path, errno); // !!!
         add_connection(con);
         return -errno;
     } else {
@@ -257,8 +249,6 @@ static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             strncpy(dname, &d_names[i] + 1, dname_len);
             filler(buf, (const char *)dname, NULL, 0);
         }
-        printf("READDIR0 %s %u\n", path,
-               recv_packet_header.payload_length); // !!!
         add_connection(con);
         return 0;
     }
@@ -269,8 +259,6 @@ static int netfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
                       struct fuse_file_info *fi)
 {
-    fprintf(stdout, "Read %s %ld\n", path, pthread_self()); // !!!
-
     int path_len = strlen(path);
     uint32_t send_payload_length = sizeof(struct netfs_read_write) + path_len;
     uint8_t send_packet[NETFS_PACKET_SIZE(send_payload_length)];
@@ -288,12 +276,12 @@ static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
     struct netfs_header recv_packet_header;
     if (sendall(con->sock_fd, send_packet,
                 NETFS_PACKET_SIZE(send_payload_length)) < 0) {
-        fprintf(stderr, "No connection %s\n", strerror(errno));
+        fprintf(stderr, "Connection Lost %s\n", strerror(errno));
         remove_connection(con);
         return -ENOENT;
     }
     if (recvall(con->sock_fd, &recv_packet_header, NETFS_HEADER_SIZE) < 0) {
-        fprintf(stderr, "No connection %s\n", strerror(errno));
+        fprintf(stderr, "Connection Lost %s\n", strerror(errno));
         remove_connection(con);
         return -ENOENT;
     }
@@ -309,7 +297,7 @@ static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
     void *recv_packet_payload = malloc(recv_packet_header.payload_length);
     if (recvall(con->sock_fd, recv_packet_payload,
                 recv_packet_header.payload_length) < 0) {
-        fprintf(stderr, "No connection %s\n", strerror(errno));
+        fprintf(stderr, "Connection Lost %s\n", strerror(errno));
         free(recv_packet_payload);
         remove_connection(con);
         return -ENOENT;
@@ -317,12 +305,10 @@ static int netfs_read(const char *path, char *buf, size_t size, off_t offset,
 
     if (recv_packet_header.operation == ERROR) {
         errno = ntohl(*(uint32_t *)recv_packet_payload);
-        printf("READ ERROR%d\n", errno);
         free(recv_packet_payload);
         add_connection(con);
         return -errno;
     } else {
-        printf("READ: %s %lu %lu\n", path, size, offset); // !!!
         int read_bytes = recv_packet_header.payload_length;
         memcpy(buf, recv_packet_payload, recv_packet_header.payload_length);
         free(recv_packet_payload);
